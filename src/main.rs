@@ -1,32 +1,83 @@
-use actix_web::{App, HttpServer};
-use actix_web_static_files;
-use crossbeam_channel::unbounded;
+use futures::prelude::*;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::{fs, io, net, process, thread, time};
-use tungstenite::server::accept;
-use tungstenite::Message;
-
-include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::{fs, io};
+use tokio::process;
+use tokio::sync::broadcast::{self, Receiver};
+use twitch_irc::login::StaticLoginCredentials;
+use twitch_irc::{ClientConfig, TCPTransport, TwitchIRCClient};
+use warp::ws::Message;
+use warp::Filter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPLAYS_DIR: &str = "replay_queue";
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Clone)]
 enum BasilMessage {
     GameCompleted,
     StartedReplay(String),
     Next5Games(Vec<String>),
 }
 
-/// A WebSocket echo server
-fn main() {
+#[derive(Deserialize)]
+struct Config {
+    twitch: TwitchConfig,
+}
+
+#[derive(Deserialize)]
+struct TwitchConfig {
+    channel: String,
+    bot_name: String,
+    oauth_token: String,
+}
+
+async fn connect_to_twitch(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
+    let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
+        config.twitch.bot_name.clone(),
+        Some(config.twitch.oauth_token.clone()),
+    ));
+    let (_, client) = TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
+    /*
+    let h = tokio::spawn(async move {
+        while let Some(message) = incoming_messages.next().await {
+            println!("Received message: {:?}", message);
+        }
+    });
+    */
+    while let Ok(message) = rx.recv().await {
+        if let BasilMessage::StartedReplay(replay) = message {
+            client
+                .say(config.twitch.channel.clone(), replay)
+                .await
+                .unwrap()
+        }
+    }
+    client.join(config.twitch.channel.clone());
+    //    h.await.unwrap()
+}
+
+async fn load_config() -> Result<Config, String> {
+    let config: Config = toml::from_slice(
+        &tokio::fs::read("config.toml")
+            .await
+            .map_err(|e| format!("config.toml required: {}", e))?,
+    )
+    .unwrap();
+    Ok(config)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
     println!("BASIL Replay Control Program {}", VERSION);
-    let (tx, rx) = unbounded();
-    thread::spawn(move || {
-        let mut rng = thread_rng();
+    let config = Arc::new(load_config().await?);
+    let (broadcast_tx, rx) = broadcast::channel(5);
+
+    tokio::spawn(connect_to_twitch(rx, config));
+
+    let tx = broadcast_tx.clone();
+    let replayer = tokio::spawn(async move {
         let mut game_queue = vec![];
         loop {
             let entries = fs::read_dir(REPLAYS_DIR).unwrap_or_else(|_| {
@@ -37,17 +88,20 @@ fn main() {
                 .map(|res| res.map(|e| e.path()))
                 .collect::<Result<Vec<_>, io::Error>>().unwrap();
 
-            let mut next_items = entries
-                .iter()
-                .filter(|it| game_queue.iter().find(|x| x == it).is_none())
-                .cloned()
-                .choose_multiple(&mut rng, 5 - game_queue.len());
+            let mut next_items = {
+                let mut rng = thread_rng();
+                entries
+                    .iter()
+                    .filter(|it| game_queue.iter().find(|x| x == it).is_none())
+                    .cloned()
+                    .choose_multiple(&mut rng, 5 - game_queue.len())
+            };
             game_queue.append(&mut next_items);
             let next_5_games: Vec<_> = game_queue
                 .iter()
                 .map(|x| x.iter().last().unwrap().to_string_lossy().to_string())
                 .collect();
-            tx.send(BasilMessage::Next5Games(next_5_games)).unwrap();
+            tx.send(BasilMessage::Next5Games(next_5_games)).ok();
             if let Some(current_replay) = game_queue.first() {
                 tx.send(BasilMessage::StartedReplay(
                     current_replay
@@ -57,51 +111,41 @@ fn main() {
                         .to_string_lossy()
                         .to_string(),
                 ))
-                .unwrap();
+                .ok();
                 process::Command::new("./ReplayViewer")
                     .env("BWAPI_CONFIG_AUTO_MENU__MAP", &current_replay)
-                    .output()
+                    .spawn()
+                    .expect("Could not execute ReplayViewer")
+                    .await
                     .expect("Could not execute ReplayViewer");
                 fs::remove_file(&current_replay).ok();
-                game_queue.swap_remove(0);
-                tx.send(BasilMessage::GameCompleted).unwrap();
+                game_queue.remove(0);
+                tx.send(BasilMessage::GameCompleted).ok();
             } else {
                 println!(
                     "No replays found (retrying in 5 seconds). Copy some into '{}'.",
                     REPLAYS_DIR
                 );
-                thread::sleep(time::Duration::from_secs(5));
+                tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
             }
         }
     });
-    thread::spawn(|| {
-        let _unused = actix_rt::System::new("basil");
-        HttpServer::new(move || {
-            let generated = generate();
-            App::new().service(actix_web_static_files::ResourceFiles::new("/", generated))
-        })
-        .bind("127.0.0.1:8080")
-        .unwrap()
-        .run();
-    });
-    let server = net::TcpListener::bind("127.0.0.1:9001").unwrap();
-    for stream in server.incoming() {
-        let rx = rx.clone();
-        thread::spawn(move || {
-            let stream = stream.unwrap();
-            let mut websocket = accept(stream).unwrap();
-            loop {
-                let message = rx.recv().expect("recv failed");
-                websocket
-                    .write_message(Message::text(serde_json::to_string(&message).unwrap()))
-                    .unwrap();
-                /*                let msg = websocket.read_message().unwrap();
-                // We do not want to send back ping/pong messages.
-                if msg.is_binary() || msg.is_text() {
-                    websocket.write_message(msg).unwrap();
+
+    let fs = warp::fs::dir("bottom");
+    let http_server = tokio::spawn(warp::serve(fs).run(([127, 0, 0, 1], 8080)));
+    let rx = warp::any().map(move || broadcast_tx.clone().subscribe());
+    let ws = warp::any().and(warp::ws()).and(rx).map(
+        |ws: warp::ws::Ws, mut rx: Receiver<BasilMessage>| {
+            ws.on_upgrade(move |websocket| async move {
+                let (mut tx, _) = websocket.split();
+                while let Ok(message) = rx.recv().await {
+                    let json = serde_json::to_string(&message).unwrap();
+                    tx.send(Message::text(json)).await.unwrap();
                 }
-                */
-            }
-        });
-    }
+            })
+        },
+    );
+    let ws_server = warp::serve(ws).run(([127, 0, 0, 1], 9001));
+    let (_, _, _) = tokio::join!(replayer, ws_server, http_server);
+    Ok(())
 }

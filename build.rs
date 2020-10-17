@@ -22,7 +22,5 @@ fn main() {
     NpmBuild::new("./site")
     .install().unwrap()
     .run("build").unwrap()
-    .target("./site/dist")
-    .to_resource_dir()
-    .build().unwrap();
+    .target("./site/dist");
 }
