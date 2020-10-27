@@ -1,6 +1,6 @@
 use actix_web_static_files::NpmBuild;
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 fn visit_dirs(dir: &Path) -> std::io::Result<()> {
     if dir.is_dir() {
@@ -20,7 +20,9 @@ fn visit_dirs(dir: &Path) -> std::io::Result<()> {
 fn main() {
     visit_dirs(Path::new("site")).unwrap();
     NpmBuild::new("./site")
-    .install().unwrap()
-    .run("build").unwrap()
-    .target("./site/dist");
+        .install()
+        .unwrap()
+        .run("build")
+        .unwrap()
+        .target("./site/dist");
 }

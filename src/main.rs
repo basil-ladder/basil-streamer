@@ -17,55 +17,149 @@ const REPLAYS_DIR: &str = "replay_queue";
 #[derive(Debug, Serialize, Clone)]
 enum BasilMessage {
     GameCompleted,
-    StartedReplay(String),
-    Next5Games(Vec<String>),
+    StartedReplay(serde_json::Value),
+    Next5Games(Vec<serde_json::Value>),
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct Config {
+    replay_base_url: String,
     twitch: TwitchConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct TwitchConfig {
     channel: String,
     bot_name: String,
     oauth_token: String,
 }
 
-async fn connect_to_twitch(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
-    let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
-        config.twitch.bot_name.clone(),
-        Some(config.twitch.oauth_token.clone()),
-    ));
-    let (_, client) = TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
-    /*
-    let h = tokio::spawn(async move {
-        while let Some(message) = incoming_messages.next().await {
-            println!("Received message: {:?}", message);
+async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
+    if !config.twitch.bot_name.is_empty() {
+        let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
+            config.twitch.bot_name.clone(),
+            Some(config.twitch.oauth_token.clone()),
+        ));
+        let (_, client) =
+            TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
+        while let Ok(message) = rx.recv().await {
+            if let BasilMessage::StartedReplay(replay) = message {
+                client
+                    .say(
+                        config.twitch.channel.clone(),
+                        format!("{}{}", config.replay_base_url, replay),
+                    )
+                    .await
+                    .ok();
+            }
         }
-    });
-    */
-    while let Ok(message) = rx.recv().await {
-        if let BasilMessage::StartedReplay(replay) = message {
-            client
-                .say(config.twitch.channel.clone(), replay)
-                .await
-                .unwrap()
-        }
+        client.join(config.twitch.channel.clone());
     }
-    client.join(config.twitch.channel.clone());
-    //    h.await.unwrap()
 }
 
 async fn load_config() -> Result<Config, String> {
-    let config: Config = toml::from_slice(
-        &tokio::fs::read("config.toml")
-            .await
-            .map_err(|e| format!("config.toml required: {}", e))?,
-    )
-    .unwrap();
-    Ok(config)
+    tokio::fs::read("config.toml")
+        .await
+        .map_err(|e| format!("config.toml required: {}", e))
+        .and_then(|data| {
+            toml::from_slice(&data).map_err(|e| format!("config.toml required: {}", e))
+        })
+        .unwrap_or_else(|e| {
+            panic!(format!(
+                "Could not load config: {}\nNeed a valid config? Here, have one:\n{}",
+                e,
+                toml::to_string(&Config::default()).unwrap()
+            ))
+        })
+}
+
+async fn serve(broadcast_tx: broadcast::Sender<BasilMessage>) {
+    let fs = warp::fs::dir("site");
+    let rx = warp::any().map(move || broadcast_tx.clone().subscribe());
+    let ws = warp::path("service").and(warp::ws()).and(rx).map(
+        |ws: warp::ws::Ws, mut rx: Receiver<BasilMessage>| {
+            ws.on_upgrade(move |websocket| async move {
+                let (mut tx, _) = websocket.split();
+                while let Ok(message) = rx.recv().await {
+                    let json = serde_json::to_string(&message).unwrap();
+                    tx.send(Message::text(json)).await.ok();
+                }
+            })
+        },
+    );
+    warp::serve(fs.or(ws)).run(([127, 0, 0, 1], 8080)).await
+}
+
+async fn replay_runner(tx: broadcast::Sender<BasilMessage>) {
+    let mut game_queue = vec![];
+    loop {
+        let entries = fs::read_dir(REPLAYS_DIR).unwrap_or_else(|_| {
+            println!("'{}' directory is missing. I'll create one for you! Replays placed there will automatically be scheduled for playing, and will be deleted(!!) afterwards.", REPLAYS_DIR);
+            fs::create_dir(REPLAYS_DIR).unwrap_or_else(|_| panic!("Could not create {}", REPLAYS_DIR));
+            fs::read_dir(REPLAYS_DIR).unwrap_or_else(|_| panic!("'{}' still missing, please create it.", REPLAYS_DIR))
+        })
+            .map(|res| res.map(|e| e.path()))
+            .collect::<Result<Vec<_>, io::Error>>()
+            .unwrap();
+
+        let mut next_items = {
+            let mut rng = thread_rng();
+            entries
+                .iter()
+                .filter(|it| game_queue.iter().find(|x| x == it).is_none())
+                .cloned()
+                .choose_multiple(&mut rng, 5 - game_queue.len())
+        };
+        game_queue.append(&mut next_items);
+        let next_5_games: Vec<_> = game_queue
+            .iter()
+            .map(|x| process::Command::new("./ReplayInfo").arg(x).output())
+            .collect();
+        let replay_infos = futures::future::join_all(next_5_games).await;
+        let next_5_games: Result<Vec<_>, String> = replay_infos
+            .iter()
+            .map(|x| {
+                x.as_ref().map_err(|e| format!("{}", e)).and_then(|output| {
+                    serde_json::from_slice(&output.stdout).map_err(|e| format!("{}", e))
+                })
+            })
+            .collect();
+        match next_5_games {
+            Ok(next_5_games) => {
+                let current_replay = next_5_games.first().cloned();
+
+                tx.send(BasilMessage::Next5Games(next_5_games)).ok();
+
+                if let Some(current_replay) = current_replay {
+                    tx.send(BasilMessage::StartedReplay(current_replay)).ok();
+                }
+                if let Some(current_replay) = game_queue.first() {
+                    let process = process::Command::new("./ReplayViewer")
+                        .env("BWAPI_CONFIG_AUTO_MENU__MAP", &current_replay)
+                        .spawn();
+                    if let Ok(process) = process {
+                        process.await.expect("Could not execute ReplayViewer");
+                        fs::remove_file(&current_replay).ok();
+                        game_queue.remove(0);
+                        tx.send(BasilMessage::GameCompleted).ok();
+                    } else {
+                        println!("Could not execute ReplayViewer - please check if its present and executable. Pausing for 15 seconds");
+                        tokio::time::delay_for(tokio::time::Duration::from_secs(15)).await;
+                    }
+                } else {
+                    println!(
+                        "No replays found (retrying in 5 seconds). Copy some into '{}'.",
+                        REPLAYS_DIR
+                    );
+                    tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+            Err(e) => {
+                println!("Could not execute ReplayInfo: {}  - please check if its present and executable. Pausing for 15 seconds", e);
+                tokio::time::delay_for(tokio::time::Duration::from_secs(15)).await;
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -74,78 +168,10 @@ async fn main() -> Result<(), String> {
     let config = Arc::new(load_config().await?);
     let (broadcast_tx, rx) = broadcast::channel(5);
 
-    tokio::spawn(connect_to_twitch(rx, config));
+    tokio::spawn(twitch_bot(rx, config));
+    let replayer = tokio::spawn(replay_runner(broadcast_tx.clone()));
+    let http_server = tokio::spawn(serve(broadcast_tx));
 
-    let tx = broadcast_tx.clone();
-    let replayer = tokio::spawn(async move {
-        let mut game_queue = vec![];
-        loop {
-            let entries = fs::read_dir(REPLAYS_DIR).unwrap_or_else(|_| {
-                println!("'{}' directory is missing. I'll create one for you! Replays placed there will automatically be scheduled for playing, and will be deleted(!!) afterwards.", REPLAYS_DIR);
-                fs::create_dir(REPLAYS_DIR).unwrap_or_else(|_| panic!("Could not create {}", REPLAYS_DIR));
-                fs::read_dir(REPLAYS_DIR).unwrap_or_else(|_| panic!("'{}' still missing, please create it.", REPLAYS_DIR))
-            })
-                .map(|res| res.map(|e| e.path()))
-                .collect::<Result<Vec<_>, io::Error>>().unwrap();
-
-            let mut next_items = {
-                let mut rng = thread_rng();
-                entries
-                    .iter()
-                    .filter(|it| game_queue.iter().find(|x| x == it).is_none())
-                    .cloned()
-                    .choose_multiple(&mut rng, 5 - game_queue.len())
-            };
-            game_queue.append(&mut next_items);
-            let next_5_games: Vec<_> = game_queue
-                .iter()
-                .map(|x| x.iter().last().unwrap().to_string_lossy().to_string())
-                .collect();
-            tx.send(BasilMessage::Next5Games(next_5_games)).ok();
-            if let Some(current_replay) = game_queue.first() {
-                tx.send(BasilMessage::StartedReplay(
-                    current_replay
-                        .iter()
-                        .last()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string(),
-                ))
-                .ok();
-                process::Command::new("./ReplayViewer")
-                    .env("BWAPI_CONFIG_AUTO_MENU__MAP", &current_replay)
-                    .spawn()
-                    .expect("Could not execute ReplayViewer")
-                    .await
-                    .expect("Could not execute ReplayViewer");
-                fs::remove_file(&current_replay).ok();
-                game_queue.remove(0);
-                tx.send(BasilMessage::GameCompleted).ok();
-            } else {
-                println!(
-                    "No replays found (retrying in 5 seconds). Copy some into '{}'.",
-                    REPLAYS_DIR
-                );
-                tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    });
-
-    let fs = warp::fs::dir("bottom");
-    let http_server = tokio::spawn(warp::serve(fs).run(([127, 0, 0, 1], 8080)));
-    let rx = warp::any().map(move || broadcast_tx.clone().subscribe());
-    let ws = warp::any().and(warp::ws()).and(rx).map(
-        |ws: warp::ws::Ws, mut rx: Receiver<BasilMessage>| {
-            ws.on_upgrade(move |websocket| async move {
-                let (mut tx, _) = websocket.split();
-                while let Ok(message) = rx.recv().await {
-                    let json = serde_json::to_string(&message).unwrap();
-                    tx.send(Message::text(json)).await.unwrap();
-                }
-            })
-        },
-    );
-    let ws_server = warp::serve(ws).run(([127, 0, 0, 1], 9001));
-    let (_, _, _) = tokio::join!(replayer, ws_server, http_server);
+    let (_, _) = tokio::join!(replayer, http_server);
     Ok(())
 }

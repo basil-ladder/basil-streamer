@@ -4,6 +4,13 @@ const context = {
 
 };
 
+const player_part = (p) => html`<span class="race_${p.race}">${p.name}</span>`;
+
+const game_item = (g) => html`
+<li class=${g === context.currentGame ? "active" : null}>${player_part(g.players[0])} vs ${player_part(g.players[1])} on
+    ${g.map}</li>
+`;
+
 const page = () => html`
 <div>
     <h1>BASIL-Ladder</h1>
@@ -12,8 +19,7 @@ ${context.next5Games && context.next5Games.length > 0 ? html`
 <div>
     <h3>Next ${context.next5Games.length} games:</h3>
     <ul>
-        ${context.next5Games.map((item) => html`<li class=${item===context.currentGame ? "active" : null}>${item}</li>
-        `)}
+        ${context.next5Games.map((item) => game_item(item))}
     </ul>
 </div>` : html``}
 `;
@@ -21,7 +27,7 @@ ${context.next5Games && context.next5Games.length > 0 ? html`
 render(page(), document.body);
 
 function connect() {
-    const ws = new WebSocket("ws://localhost:9001");
+    const ws = new WebSocket("ws://localhost:" + location.port + "/service");
     ws.onerror = (_) => {
         setTimeout(connect, 5000);
     };

@@ -1,3 +1,7 @@
+$protoss-color: #f1c232;
+$terran-color: #6fa8dc;
+$zerg-color: #c27ba0;
+
 .flex-column-container {
     display: flex;
     align-items: flex-start;
@@ -22,4 +26,10 @@ html {
 
 h3 {
     margin: 0 0;
+}
+
+@each $race, $color in (protoss: $protoss-color, terran: $terran-color, zerg: $zerg-color) {
+    .race_#{$race} {
+        color: $color;
+    }
 }
