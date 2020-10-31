@@ -43,7 +43,7 @@ function connect() {
         }
         const startedReplay = msg['StartedReplay'];
         if (startedReplay) {
-            context.currentGame = startedReplay;
+            context.currentGame = startedReplay[1];
         }
         if (msg['GameCompleted']) {
             context.currentGame = null;

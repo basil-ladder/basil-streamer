@@ -17,7 +17,7 @@ const REPLAYS_DIR: &str = "replay_queue";
 #[derive(Debug, Serialize, Clone)]
 enum BasilMessage {
     GameCompleted,
-    StartedReplay(serde_json::Value),
+    StartedReplay(String, serde_json::Value),
     Next5Games(Vec<serde_json::Value>),
 }
 
@@ -43,14 +43,8 @@ async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
         let (_, client) =
             TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
         while let Ok(message) = rx.recv().await {
-            if let BasilMessage::StartedReplay(replay) = message {
-                client
-                    .say(
-                        config.twitch.channel.clone(),
-                        format!("{}{}", config.replay_base_url, replay),
-                    )
-                    .await
-                    .ok();
+            if let BasilMessage::StartedReplay(url, _) = message {
+                client.say(config.twitch.channel.clone(), url).await.ok();
             }
         }
         client.join(config.twitch.channel.clone());
@@ -62,9 +56,9 @@ async fn load_config() -> Result<Config, String> {
         .await
         .map_err(|e| format!("config.toml required: {}", e))
         .and_then(|data| {
-            toml::from_slice(&data).map_err(|e| format!("config.toml required: {}", e))
+            toml::from_slice(&data).map_err(|e| format!("config.toml could not be parsed: {}", e))
         })
-        .unwrap_or_else(|e| {
+        .map_err(|e| {
             panic!(format!(
                 "Could not load config: {}\nNeed a valid config? Here, have one:\n{}",
                 e,
@@ -90,7 +84,7 @@ async fn serve(broadcast_tx: broadcast::Sender<BasilMessage>) {
     warp::serve(fs.or(ws)).run(([127, 0, 0, 1], 8080)).await
 }
 
-async fn replay_runner(tx: broadcast::Sender<BasilMessage>) {
+async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>) {
     let mut game_queue = vec![];
     loop {
         let entries = fs::read_dir(REPLAYS_DIR).unwrap_or_else(|_| {
@@ -126,20 +120,44 @@ async fn replay_runner(tx: broadcast::Sender<BasilMessage>) {
             .collect();
         match next_5_games {
             Ok(next_5_games) => {
-                let current_replay = next_5_games.first().cloned();
+                let info_of_replay_to_play = next_5_games.first().cloned();
 
                 tx.send(BasilMessage::Next5Games(next_5_games)).ok();
 
-                if let Some(current_replay) = current_replay {
-                    tx.send(BasilMessage::StartedReplay(current_replay)).ok();
-                }
-                if let Some(current_replay) = game_queue.first() {
+                if let (Some(current_replay), Some(replay_file)) =
+                    (info_of_replay_to_play, game_queue.first())
+                {
+                    let url_suffix_candidate =
+                        &*replay_file.iter().last().unwrap().to_string_lossy();
+                    let (replay_file, file_name) = if replay_file.extension().is_some() && replay_file.extension().unwrap() == "rep" {
+                        (
+                            replay_file.clone(),
+                            replay_file
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_string(),
+                        )
+                    } else {
+                        let decoded = base64::decode(url_suffix_candidate).unwrap();
+                        let url_suffix = String::from_utf8(decoded).unwrap();
+
+                        let mut rename_path = replay_file.to_path_buf();
+                        rename_path.pop();
+                        rename_path.push("next_replay.rep");
+                        std::fs::rename(replay_file, &rename_path).unwrap();
+                        (rename_path, url_suffix)
+                    };
+                    let url_suffix = url::form_urlencoded::byte_serialize(&file_name.as_bytes()).collect::<String>();
+                    let url = config.replay_base_url.clone() + &url_suffix;
+                    tx.send(BasilMessage::StartedReplay(url, current_replay))
+                        .ok();
                     let process = process::Command::new("./ReplayViewer")
-                        .env("BWAPI_CONFIG_AUTO_MENU__MAP", &current_replay)
+                        .env("BWAPI_CONFIG_AUTO_MENU__MAP", &replay_file)
                         .spawn();
                     if let Ok(process) = process {
                         process.await.expect("Could not execute ReplayViewer");
-                        fs::remove_file(&current_replay).ok();
+                        fs::remove_file(&replay_file).ok();
                         game_queue.remove(0);
                         tx.send(BasilMessage::GameCompleted).ok();
                     } else {
@@ -168,8 +186,8 @@ async fn main() -> Result<(), String> {
     let config = Arc::new(load_config().await?);
     let (broadcast_tx, rx) = broadcast::channel(5);
 
-    tokio::spawn(twitch_bot(rx, config));
-    let replayer = tokio::spawn(replay_runner(broadcast_tx.clone()));
+    tokio::spawn(twitch_bot(rx, config.clone()));
+    let replayer = tokio::spawn(replay_runner(broadcast_tx.clone(), config));
     let http_server = tokio::spawn(serve(broadcast_tx));
 
     let (_, _) = tokio::join!(replayer, http_server);
