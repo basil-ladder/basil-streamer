@@ -1,0 +1,6 @@
+replay_base_url = ""
+
+[twitch]
+channel = ""
+bot_name = ""
+oauth_token = ""

@@ -7,7 +7,7 @@ use std::{fs, io};
 use tokio::process;
 use tokio::sync::broadcast::{self, Receiver};
 use twitch_irc::login::StaticLoginCredentials;
-use twitch_irc::{ClientConfig, TCPTransport, TwitchIRCClient};
+use twitch_irc::{transport::tcp::TCPTransport, ClientConfig, TwitchIRCClient};
 use warp::ws::Message;
 use warp::Filter;
 
@@ -34,22 +34,22 @@ struct TwitchConfig {
     oauth_token: String,
 }
 
-async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
-    if !config.twitch.bot_name.is_empty() {
-        let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
-            config.twitch.bot_name.clone(),
-            Some(config.twitch.oauth_token.clone()),
-        ));
-        let (_, client) =
-            TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
-        while let Ok(message) = rx.recv().await {
-            if let BasilMessage::StartedReplay(url, _) = message {
-                client.say(config.twitch.channel.clone(), url).await.ok();
-            }
-        }
-        client.join(config.twitch.channel.clone());
-    }
-}
+// async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
+//     if !config.twitch.bot_name.is_empty() {
+//         let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
+//             config.twitch.bot_name.clone(),
+//             Some(config.twitch.oauth_token.clone()),
+//         ));
+//         let (_, client) =
+//             TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
+//         while let Ok(message) = rx.recv().await {
+//             if let BasilMessage::StartedReplay(url, _) = message {
+//                 client.say(config.twitch.channel.clone(), url).await.ok();
+//             }
+//         }
+//         client.join(config.twitch.channel.clone());
+//     }
+// }
 
 async fn load_config() -> Result<Config, String> {
     tokio::fs::read("config.toml")
@@ -81,7 +81,9 @@ async fn serve(broadcast_tx: broadcast::Sender<BasilMessage>) {
             })
         },
     );
-    warp::serve(fs.or(ws)).run(([127, 0, 0, 1], 8080)).await
+    warp::serve(fs.or(ws))
+        .try_bind(([127, 0, 0, 1], 8080))
+        .await
 }
 
 async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>) {
@@ -129,7 +131,9 @@ async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>)
                 {
                     let url_suffix_candidate =
                         &*replay_file.iter().last().unwrap().to_string_lossy();
-                    let (replay_file, file_name) = if replay_file.extension().is_some() && replay_file.extension().unwrap() == "rep" {
+                    let (replay_file, file_name) = if replay_file.extension().is_some()
+                        && replay_file.extension().unwrap() == "rep"
+                    {
                         (
                             replay_file.clone(),
                             replay_file
@@ -148,33 +152,37 @@ async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>)
                         std::fs::rename(replay_file, &rename_path).unwrap();
                         (rename_path, url_suffix)
                     };
-                    let url_suffix = url::form_urlencoded::byte_serialize(&file_name.as_bytes()).collect::<String>();
+                    let url_suffix = url::form_urlencoded::byte_serialize(&file_name.as_bytes())
+                        .collect::<String>();
                     let url = config.replay_base_url.clone() + &url_suffix;
                     tx.send(BasilMessage::StartedReplay(url, current_replay))
                         .ok();
                     let process = process::Command::new("./ReplayViewer")
                         .env("BWAPI_CONFIG_AUTO_MENU__MAP", &replay_file)
                         .spawn();
-                    if let Ok(process) = process {
-                        process.await.expect("Could not execute ReplayViewer");
+                    if let Ok(mut process) = process {
+                        process
+                            .wait()
+                            .await
+                            .expect("Could not execute ReplayViewer");
                         fs::remove_file(&replay_file).ok();
                         game_queue.remove(0);
                         tx.send(BasilMessage::GameCompleted).ok();
                     } else {
                         println!("Could not execute ReplayViewer - please check if its present and executable. Pausing for 15 seconds");
-                        tokio::time::delay_for(tokio::time::Duration::from_secs(15)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                     }
                 } else {
                     println!(
                         "No replays found (retrying in 5 seconds). Copy some into '{}'.",
                         REPLAYS_DIR
                     );
-                    tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
             }
             Err(e) => {
                 println!("Could not execute ReplayInfo: {}  - please check if its present and executable. Pausing for 15 seconds", e);
-                tokio::time::delay_for(tokio::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
             }
         }
     }
@@ -186,7 +194,7 @@ async fn main() -> Result<(), String> {
     let config = Arc::new(load_config().await?);
     let (broadcast_tx, rx) = broadcast::channel(5);
 
-    tokio::spawn(twitch_bot(rx, config.clone()));
+    // tokio::spawn(twitch_bot(rx, config.clone()));
     let replayer = tokio::spawn(replay_runner(broadcast_tx.clone(), config));
     let http_server = tokio::spawn(serve(broadcast_tx));
 
