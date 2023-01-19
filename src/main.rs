@@ -7,7 +7,7 @@ use std::{fs, io};
 use tokio::process;
 use tokio::sync::broadcast::{self, Receiver};
 use twitch_irc::login::StaticLoginCredentials;
-use twitch_irc::{transport::tcp::TCPTransport, ClientConfig, TwitchIRCClient};
+use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 use warp::ws::Message;
 use warp::Filter;
 
@@ -34,22 +34,22 @@ struct TwitchConfig {
     oauth_token: String,
 }
 
-// async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
-//     if !config.twitch.bot_name.is_empty() {
-//         let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
-//             config.twitch.bot_name.clone(),
-//             Some(config.twitch.oauth_token.clone()),
-//         ));
-//         let (_, client) =
-//             TwitchIRCClient::<TCPTransport, StaticLoginCredentials>::new(client_config);
-//         while let Ok(message) = rx.recv().await {
-//             if let BasilMessage::StartedReplay(url, _) = message {
-//                 client.say(config.twitch.channel.clone(), url).await.ok();
-//             }
-//         }
-//         client.join(config.twitch.channel.clone());
-//     }
-// }
+async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) {
+    if !config.twitch.bot_name.is_empty() {
+        let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
+            config.twitch.bot_name.clone(),
+            Some(config.twitch.oauth_token.clone()),
+        ));
+        let (_, client) =
+            TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(client_config);
+        while let Ok(message) = rx.recv().await {
+            if let BasilMessage::StartedReplay(url, _) = message {
+                client.say(config.twitch.channel.clone(), url).await.ok();
+            }
+        }
+        client.join(config.twitch.channel.clone());
+    }
+}
 
 async fn load_config() -> Result<Config, String> {
     tokio::fs::read("config.toml")
@@ -59,11 +59,11 @@ async fn load_config() -> Result<Config, String> {
             toml::from_slice(&data).map_err(|e| format!("config.toml could not be parsed: {}", e))
         })
         .map_err(|e| {
-            panic!(format!(
+            panic!(
                 "Could not load config: {}\nNeed a valid config? Here, have one:\n{}",
                 e,
                 toml::to_string(&Config::default()).unwrap()
-            ))
+            )
         })
 }
 
@@ -194,7 +194,7 @@ async fn main() -> Result<(), String> {
     let config = Arc::new(load_config().await?);
     let (broadcast_tx, rx) = broadcast::channel(5);
 
-    // tokio::spawn(twitch_bot(rx, config.clone()));
+    tokio::spawn(twitch_bot(rx, config.clone()));
     let replayer = tokio::spawn(replay_runner(broadcast_tx.clone(), config));
     let http_server = tokio::spawn(serve(broadcast_tx));
 
