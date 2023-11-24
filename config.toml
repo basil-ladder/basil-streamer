@@ -1,6 +1,6 @@
 replay_base_url = ""
 
 [twitch]
-channel = ""
-bot_name = ""
-oauth_token = ""
+channel = "basilladder"
+bot_name = "basilladder"
+oauth_token = "cwn423x0e6h3njkl0mghjmqas7oe4g"
