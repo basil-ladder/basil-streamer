@@ -164,17 +164,24 @@ async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>)
         let replay_infos = futures::future::join_all(next_5_games).await;
         let mut next_5_games = Vec::new();
         for (file_name, output) in game_queue.iter().zip(replay_infos) {
-            let Ok(output) = output else {
-                println!("Failed to parse {} - deleting", file_name.display());
-                fs::remove_file(&file_name).ok();
-                continue;
-            };
-            let parsed = serde_json::from_slice(&output.stdout);
-            if let Ok(game_info) = parsed {
-                next_5_games.push(game_info);
-            } else {
-                println!("{} is not a valid replay - deleting", file_name.display());
-                fs::remove_file(&file_name).ok();
+            match output {
+                Ok(output) => {
+                    let parsed = serde_json::from_slice(&output.stdout);
+                    match parsed {
+                        Ok(game_info) => {
+                            next_5_games.push(game_info);
+                        }
+                        Err(err) => {
+                            println!("{} is not a valid replay: {}", file_name.display(), err);
+                            fs::remove_file(&file_name).ok();
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("Failed to parse {}: {}", file_name.display(), err);
+                    fs::remove_file(&file_name).ok();
+                    continue;
+                }
             }
         }
         if !next_5_games.is_empty() {
