@@ -162,89 +162,92 @@ async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>)
             .map(|x| process::Command::new("./ReplayInfo").arg(x).output())
             .collect();
         let replay_infos = futures::future::join_all(next_5_games).await;
-        let next_5_games: Result<Vec<_>, String> = replay_infos
-            .iter()
-            .map(|x| {
-                x.as_ref().map_err(|e| format!("{}", e)).and_then(|output| {
-                    serde_json::from_slice(&output.stdout).map_err(|e| format!("{}", e))
-                })
-            })
-            .collect();
-        match next_5_games {
-            Ok(next_5_games) => {
-                let info_of_replay_to_play = next_5_games.first().cloned();
+        let mut next_5_games = Vec::new();
+        for (file_name, output) in game_queue.iter().zip(replay_infos) {
+            let Ok(output) = output else {
+                println!("Failed to parse {} - deleting", file_name.display());
+                fs::remove_file(&file_name).ok();
+                continue;
+            };
+            let parsed = serde_json::from_slice(&output.stdout);
+            if let Ok(game_info) = parsed {
+                next_5_games.push(game_info);
+            } else {
+                println!("{} is not a valid replay - deleting", file_name.display());
+                fs::remove_file(&file_name).ok();
+            }
+        }
+        if !next_5_games.is_empty() {
+            let info_of_replay_to_play = next_5_games.first().cloned();
 
-                tx.send(BasilMessage::Next5Games(next_5_games)).ok();
+            tx.send(BasilMessage::Next5Games(next_5_games)).ok();
 
-                if let (Some(current_replay), Some(replay_file)) =
-                    (info_of_replay_to_play, game_queue.first())
+            if let (Some(current_replay), Some(replay_file)) =
+                (info_of_replay_to_play, game_queue.first())
+            {
+                let url_suffix_candidate = &*replay_file.iter().last().unwrap().to_string_lossy();
+                let (replay_file, file_name) = if replay_file.extension().is_some()
+                    && replay_file.extension().unwrap() == "rep"
                 {
-                    let url_suffix_candidate =
-                        &*replay_file.iter().last().unwrap().to_string_lossy();
-                    let (replay_file, file_name) = if replay_file.extension().is_some()
-                        && replay_file.extension().unwrap() == "rep"
-                    {
-                        (
-                            replay_file.clone(),
-                            replay_file
-                                .file_name()
-                                .unwrap()
-                                .to_string_lossy()
-                                .to_string(),
-                        )
-                    } else {
-                        let decoded = base64::engine::general_purpose::STANDARD
-                            .decode(url_suffix_candidate)
-                            .unwrap();
-                        let url_suffix = String::from_utf8(decoded).unwrap();
-
-                        let mut rename_path = replay_file.to_path_buf();
-                        rename_path.pop();
-                        rename_path.push("next_replay.rep");
-                        std::fs::rename(replay_file, &rename_path).unwrap();
-                        (rename_path, url_suffix)
-                    };
-                    let url_suffix = url::form_urlencoded::byte_serialize(&file_name.as_bytes())
-                        .collect::<String>();
-                    let url = config.replay_base_url.clone() + &url_suffix;
-                    tx.send(BasilMessage::StartedReplay(url, current_replay))
-                        .ok();
-                    let process = process::Command::new("./ReplayViewer")
-                        .env("BWAPI_CONFIG_AUTO_MENU__MAP", &replay_file)
-                        .spawn();
-                    if let Ok(mut process) = process {
-                        let timeout = tokio::time::sleep(std::time::Duration::from_secs(35 * 60));
-                        tokio::pin!(timeout);
-                        tokio::select! {
-                            _ = process.wait() => {
-                            }
-                            _ = &mut timeout => {
-                                process.kill().await.expect("Could not kill ReplayViewer");
-                            }
-                        }
-                        process
-                            .wait()
-                            .await
-                            .expect("Could not execute ReplayViewer");
-                        fs::remove_file(&replay_file).ok();
-                        game_queue.remove(0);
-                        tx.send(BasilMessage::GameCompleted).ok();
-                    } else {
-                        println!("Could not execute ReplayViewer - please check if its present and executable. Pausing for 15 seconds");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                    }
+                    (
+                        replay_file.clone(),
+                        replay_file
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                    )
                 } else {
-                    println!(
-                        "No replays found (retrying in 5 seconds). Copy some into '{}'.",
-                        REPLAYS_DIR
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(url_suffix_candidate)
+                        .unwrap();
+                    let url_suffix = String::from_utf8(decoded).unwrap();
+
+                    let mut rename_path = replay_file.to_path_buf();
+                    rename_path.pop();
+                    rename_path.push("next_replay.rep");
+                    std::fs::rename(replay_file, &rename_path).unwrap();
+                    (rename_path, url_suffix)
+                };
+                let url_suffix =
+                    url::form_urlencoded::byte_serialize(&file_name.as_bytes()).collect::<String>();
+                let url = config.replay_base_url.clone() + &url_suffix;
+                tx.send(BasilMessage::StartedReplay(url, current_replay))
+                    .ok();
+                let process = process::Command::new("./ReplayViewer")
+                    .env("BWAPI_CONFIG_AUTO_MENU__MAP", &replay_file)
+                    .spawn();
+                if let Ok(mut process) = process {
+                    let timeout = tokio::time::sleep(std::time::Duration::from_secs(35 * 60));
+                    tokio::pin!(timeout);
+                    tokio::select! {
+                        _ = process.wait() => {
+                        }
+                        _ = &mut timeout => {
+                            process.kill().await.expect("Could not kill ReplayViewer");
+                        }
+                    }
+                    process
+                        .wait()
+                        .await
+                        .expect("Could not execute ReplayViewer");
+                    fs::remove_file(&replay_file).ok();
+                    game_queue.remove(0);
+                    tx.send(BasilMessage::GameCompleted).ok();
+                } else {
+                    println!("Could not execute ReplayViewer - please check if its present and executable. Pausing for 15 seconds");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                 }
+            } else {
+                println!(
+                    "No replays found (retrying in 5 seconds). Copy some into '{}'.",
+                    REPLAYS_DIR
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
-            Err(e) => {
-                println!("Could not execute ReplayInfo: {}  - please check if its present and executable. Pausing for 15 seconds", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-            }
+        } else {
+            println!("Could not find or parse any replays. Pausing for 15 seconds",);
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
         }
     }
 }
