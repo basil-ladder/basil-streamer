@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::{fs, io};
 use tokio::process;
 use tokio::sync::broadcast::{self, Receiver};
-use twitch_irc::login::StaticLoginCredentials;
-use twitch_irc::message::{NoticeMessage, ServerMessage::Notice};
-use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
+// use twitch_irc::login::StaticLoginCredentials;
+// use twitch_irc::message::{NoticeMessage, ServerMessage::Notice};
+// use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 use warp::ws::Message;
 use warp::Filter;
 
@@ -36,67 +36,67 @@ struct TwitchConfig {
     oauth_token: String,
 }
 
-async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) -> anyhow::Result<()> {
-    if !config.twitch.bot_name.is_empty() {
-        let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
-            config.twitch.bot_name.clone(),
-            Some(config.twitch.oauth_token.clone()),
-        ));
-        println!("Connecting to irc with user '{}'", config.twitch.bot_name);
-        let (mut incoming_messages, client) =
-            TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(client_config);
+// async fn twitch_bot(mut rx: Receiver<BasilMessage>, config: Arc<Config>) -> anyhow::Result<()> {
+//     if !config.twitch.bot_name.is_empty() {
+//         let client_config = ClientConfig::new_simple(StaticLoginCredentials::new(
+//             config.twitch.bot_name.clone(),
+//             Some(config.twitch.oauth_token.clone()),
+//         ));
+//         println!("Connecting to irc with user '{}'", config.twitch.bot_name);
+//         let (mut incoming_messages, client) =
+//             TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(client_config);
 
-        tokio::spawn(async move {
-            while let Some(msg) = incoming_messages.recv().await {
-                if let Notice(NoticeMessage { message_text, .. }) = msg {
-                    if message_text.contains("Login authentication failed") {
-                        eprintln!("Twitch IRC authentication error!");
-                    }
-                }
-            }
-        });
+//         tokio::spawn(async move {
+//             while let Some(msg) = incoming_messages.recv().await {
+//                 if let Notice(NoticeMessage { message_text, .. }) = msg {
+//                     if message_text.contains("Login authentication failed") {
+//                         eprintln!("Twitch IRC authentication error!");
+//                     }
+//                 }
+//             }
+//         });
 
-        client.join(config.twitch.channel.clone())?;
-        // Debug only
-        // loop {
-        //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        //     let res = client
-        //         .say(config.twitch.channel.clone(), "test".to_string())
-        //         .await;
-        //     eprintln!("S: {:?}", res);
-        // }
-        while let Ok(message) = rx.recv().await {
-            if let BasilMessage::StartedReplay(url, info) = message {
-                let Some(players) = info.get("players").map(|p| p.as_array()).flatten() else {
-                    continue;
-                };
-                let mut players = players
-                    .iter()
-                    .map(|p| p.get("name").map(|n| n.as_str()).flatten());
-                let (Some(player_a), Some(player_b)) =
-                    (players.next().flatten(), players.next().flatten())
-                else {
-                    continue;
-                };
-                client
-                    .say(
-                        config.twitch.channel.clone(),
-                        format!("Now watching '{}' vs '{}'", player_a, player_b),
-                    )
-                    .await
-                    .ok();
-                client
-                    .say(
-                        config.twitch.channel.clone(),
-                        format!("Replay URL: {}", url),
-                    )
-                    .await
-                    .ok();
-            }
-        }
-    }
-    Ok(())
-}
+//         client.join(config.twitch.channel.clone())?;
+//         // Debug only
+//         // loop {
+//         //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+//         //     let res = client
+//         //         .say(config.twitch.channel.clone(), "test".to_string())
+//         //         .await;
+//         //     eprintln!("S: {:?}", res);
+//         // }
+//         while let Ok(message) = rx.recv().await {
+//             if let BasilMessage::StartedReplay(url, info) = message {
+//                 let Some(players) = info.get("players").map(|p| p.as_array()).flatten() else {
+//                     continue;
+//                 };
+//                 let mut players = players
+//                     .iter()
+//                     .map(|p| p.get("name").map(|n| n.as_str()).flatten());
+//                 let (Some(player_a), Some(player_b)) =
+//                     (players.next().flatten(), players.next().flatten())
+//                 else {
+//                     continue;
+//                 };
+//                 client
+//                     .say(
+//                         config.twitch.channel.clone(),
+//                         format!("Now watching '{}' vs '{}'", player_a, player_b),
+//                     )
+//                     .await
+//                     .ok();
+//                 client
+//                     .say(
+//                         config.twitch.channel.clone(),
+//                         format!("Replay URL: {}", url),
+//                     )
+//                     .await
+//                     .ok();
+//             }
+//         }
+//     }
+//     Ok(())
+// }
 
 async fn load_config() -> Result<Config, String> {
     tokio::fs::read("config.toml")
@@ -256,15 +256,15 @@ async fn replay_runner(tx: broadcast::Sender<BasilMessage>, config: Arc<Config>)
 async fn main() -> Result<(), String> {
     println!("BASIL Replay Control Program {}", VERSION);
     let config = Arc::new(load_config().await?);
-    let (broadcast_tx, rx) = broadcast::channel(5);
+    let (broadcast_tx, _rx) = broadcast::channel(5);
 
-    let twitch_cfg = config.clone();
-    tokio::spawn(async {
-        let result = twitch_bot(rx, twitch_cfg);
-        if let Err(err) = result.await {
-            eprintln!("{:?}", err);
-        }
-    });
+    // let twitch_cfg = config.clone();
+    // tokio::spawn(async {
+    //     let result = twitch_bot(rx, twitch_cfg);
+    //     if let Err(err) = result.await {
+    //         eprintln!("{:?}", err);
+    //     }
+    // });
     let replayer = tokio::spawn(replay_runner(broadcast_tx.clone(), config));
     let http_server = tokio::spawn(serve(broadcast_tx));
 
